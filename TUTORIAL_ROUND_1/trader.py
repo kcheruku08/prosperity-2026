@@ -7,11 +7,12 @@ POSITION_LIMIT = {"EMERALDS": 20, "TOMATOES": 20}
 
 EMERALDS_FAIR = 10000
 EMERALDS_TAKE_EDGE = 1
-EMERALDS_MAKE_EDGE = 1
+EMERALDS_MAKE_EDGE = 2
 
 TOMATOES_WINDOW = 100
-TOMATOES_MAKE_EDGE = 4
+TOMATOES_MAKE_EDGE = 5
 TOMATOES_TAKE_EDGE = 2
+TOMATOES_Z_SKEW = 0.5  # shift quote centre by -Z_SKEW * zscore (fade deviations softly)
 
 
 def best_bid_ask(od: OrderDepth):
@@ -97,8 +98,15 @@ class Trader:
         history = history + [mid]
         history = history[-TOMATOES_WINDOW:]
 
-        # Fair = rolling mean once we have enough samples, else current mid
-        fair = sum(history) / len(history)
+        # Rolling fair value and z-score of current mid vs that mean
+        n = len(history)
+        fair = sum(history) / n
+        if n >= 5:
+            var = sum((x - fair) ** 2 for x in history) / n
+            sd = var ** 0.5
+        else:
+            sd = 0.0
+        zscore = (mid - fair) / sd if sd > 0 else 0.0
 
         buy_cap = limit - pos
         sell_cap = limit + pos
@@ -116,9 +124,11 @@ class Trader:
             orders.append(Order("TOMATOES", best_bid, -qty))
             sell_cap -= qty
 
-        # Inventory skew: shift quote centre away from current position
-        skew = -pos / limit  # in [-1, 1]
-        centre = fair + skew
+        # Inventory skew + soft z-score fade: centre shifts against position
+        # and slightly against current deviation from rolling fair.
+        inv_skew = -pos / limit  # in [-1, 1]
+        z_skew = -TOMATOES_Z_SKEW * zscore
+        centre = fair + inv_skew + z_skew
         make_bid = int(round(centre - TOMATOES_MAKE_EDGE))
         make_ask = int(round(centre + TOMATOES_MAKE_EDGE))
 
