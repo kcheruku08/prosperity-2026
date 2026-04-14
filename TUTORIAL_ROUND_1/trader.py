@@ -1,21 +1,36 @@
 from datamodel import Order, OrderDepth, TradingState, Symbol
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import json
+
+
+# Two product archetypes observed in the data:
+#
+#   EMERALDS: stationary. Mid visits {9996, 10000, 10004}; book persists at
+#   9992/10008 (16-tick spread). There is a true anchored fair value.
+#
+#   TOMATOES: non-stationary random walk. Mid drifts over tens of points;
+#   price autocorr ~= 1, return autocorr is just bid-ask bounce. No anchored
+#   fair exists — recent mid is the best estimate of next mid.
+#
+# Shared rules:
+#   1. Quote inside the visible book when possible; never quote on the wrong
+#      side of our fair estimate.
+#   2. Take opportunistically when the book crosses our fair by >= 1 tick.
+#   3. Skew quotes against inventory so we drift back to flat.
 
 
 POSITION_LIMIT = {"EMERALDS": 20, "TOMATOES": 20}
 
 EMERALDS_FAIR = 10000
-EMERALDS_TAKE_EDGE = 1
-EMERALDS_MAKE_EDGE = 2
+EMERALDS_TAKE_EDGE = 1  # take any ask <= 9999 or bid >= 10001
+EMERALDS_MAKE_EDGE = 2  # conservative: inside the 16-tick book but off the outlier prints
 
-TOMATOES_WINDOW = 100
-TOMATOES_MAKE_EDGE = 5
+TOMATOES_EMA_ALPHA = 0.05   # ~20-tick half life; tracks drift without chasing noise
 TOMATOES_TAKE_EDGE = 2
-TOMATOES_Z_SKEW = 0.5  # shift quote centre by -Z_SKEW * zscore (fade deviations softly)
+TOMATOES_MAKE_EDGE = 3      # structural: ~half of the typical 13-tick spread, inside the book
 
 
-def best_bid_ask(od: OrderDepth):
+def best_bid_ask(od: OrderDepth) -> Tuple[int, int]:
     best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
     best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
     return best_bid, best_ask
@@ -23,124 +38,104 @@ def best_bid_ask(od: OrderDepth):
 
 class Trader:
     def run(self, state: TradingState):
-        orders: Dict[Symbol, List[Order]] = {}
-
-        memory = {}
+        memory: Dict = {}
         if state.traderData:
             try:
                 memory = json.loads(state.traderData)
             except Exception:
                 memory = {}
-        mid_history: List[float] = memory.get("tomato_mids", [])
+
+        orders: Dict[Symbol, List[Order]] = {}
 
         for symbol, od in state.order_depths.items():
             pos = state.position.get(symbol, 0)
             limit = POSITION_LIMIT.get(symbol, 20)
 
             if symbol == "EMERALDS":
-                orders[symbol] = self._trade_emeralds(od, pos, limit)
+                orders[symbol] = self._make_market(
+                    symbol, od, pos, limit,
+                    fair=EMERALDS_FAIR,
+                    take_edge=EMERALDS_TAKE_EDGE,
+                    make_edge=EMERALDS_MAKE_EDGE,
+                )
             elif symbol == "TOMATOES":
-                orders[symbol], mid_history = self._trade_tomatoes(
-                    od, pos, limit, mid_history
+                best_bid, best_ask = best_bid_ask(od)
+                if best_bid is None or best_ask is None:
+                    continue
+                mid = (best_bid + best_ask) / 2
+                prev_ema = memory.get("tomatoes_ema", mid)
+                fair = TOMATOES_EMA_ALPHA * mid + (1 - TOMATOES_EMA_ALPHA) * prev_ema
+                memory["tomatoes_ema"] = fair
+
+                orders[symbol] = self._make_market(
+                    symbol, od, pos, limit,
+                    fair=fair,
+                    take_edge=TOMATOES_TAKE_EDGE,
+                    make_edge=TOMATOES_MAKE_EDGE,
                 )
 
-        memory["tomato_mids"] = mid_history[-TOMATOES_WINDOW:]
         return orders, 0, json.dumps(memory)
 
-    def _trade_emeralds(self, od: OrderDepth, pos: int, limit: int) -> List[Order]:
-        orders: List[Order] = []
-        fair = EMERALDS_FAIR
+    def _make_market(
+        self,
+        symbol: Symbol,
+        od: OrderDepth,
+        pos: int,
+        limit: int,
+        fair: float,
+        take_edge: int,
+        make_edge: int,
+    ) -> List[Order]:
+        """Generic MM: take obvious crosses, then post passive quotes anchored at fair.
+
+        Quotes are placed inside the visible book when possible (improve by 1 tick)
+        but never on the wrong side of fair. Inventory skew shifts the centre
+        against current position so we drift back to flat.
+        """
+        out: List[Order] = []
         buy_cap = limit - pos
         sell_cap = limit + pos
 
-        # Aggressive takes: any ask strictly below fair, any bid strictly above fair
-        for ask_px in sorted(od.sell_orders.keys()):
-            if ask_px <= fair - EMERALDS_TAKE_EDGE and buy_cap > 0:
-                ask_vol = -od.sell_orders[ask_px]  # sell_orders volumes are negative
-                qty = min(ask_vol, buy_cap)
-                orders.append(Order("EMERALDS", ask_px, qty))
+        # 1. Aggressive takes vs visible book
+        for ask_px in sorted(od.sell_orders):
+            if ask_px <= fair - take_edge and buy_cap > 0:
+                qty = min(-od.sell_orders[ask_px], buy_cap)
+                out.append(Order(symbol, ask_px, qty))
                 buy_cap -= qty
             else:
                 break
 
-        for bid_px in sorted(od.buy_orders.keys(), reverse=True):
-            if bid_px >= fair + EMERALDS_TAKE_EDGE and sell_cap > 0:
-                bid_vol = od.buy_orders[bid_px]
-                qty = min(bid_vol, sell_cap)
-                orders.append(Order("EMERALDS", bid_px, -qty))
+        for bid_px in sorted(od.buy_orders, reverse=True):
+            if bid_px >= fair + take_edge and sell_cap > 0:
+                qty = min(od.buy_orders[bid_px], sell_cap)
+                out.append(Order(symbol, bid_px, -qty))
                 sell_cap -= qty
             else:
                 break
 
-        # Passive make: undercut book, sit inside 9992/10008
+        # 2. Passive make, centred on fair with inventory skew
+        skew = -pos / limit  # in [-1, 1]; shifts quotes away from current inventory
+        centre = fair + skew
+
+        my_bid = int(round(centre - make_edge))
+        my_ask = int(round(centre + make_edge))
+
+        # Improve on the visible book rather than sitting behind it.
         best_bid, best_ask = best_bid_ask(od)
-        make_bid = fair - EMERALDS_MAKE_EDGE
-        make_ask = fair + EMERALDS_MAKE_EDGE
-        if best_bid is not None and best_bid >= make_bid:
-            make_bid = best_bid + 1
-        if best_ask is not None and best_ask <= make_ask:
-            make_ask = best_ask - 1
+        if best_bid is not None and best_bid >= my_bid:
+            my_bid = best_bid + 1
+        if best_ask is not None and best_ask <= my_ask:
+            my_ask = best_ask - 1
 
-        if buy_cap > 0 and make_bid < fair:
-            orders.append(Order("EMERALDS", make_bid, buy_cap))
-        if sell_cap > 0 and make_ask > fair:
-            orders.append(Order("EMERALDS", make_ask, -sell_cap))
-
-        return orders
-
-    def _trade_tomatoes(self, od: OrderDepth, pos: int, limit: int, history: List[float]):
-        orders: List[Order] = []
-        best_bid, best_ask = best_bid_ask(od)
-        if best_bid is None or best_ask is None:
-            return orders, history
-
-        mid = (best_bid + best_ask) / 2
-        history = history + [mid]
-        history = history[-TOMATOES_WINDOW:]
-
-        # Rolling fair value and z-score of current mid vs that mean
-        n = len(history)
-        fair = sum(history) / n
-        if n >= 5:
-            var = sum((x - fair) ** 2 for x in history) / n
-            sd = var ** 0.5
-        else:
-            sd = 0.0
-        zscore = (mid - fair) / sd if sd > 0 else 0.0
-
-        buy_cap = limit - pos
-        sell_cap = limit + pos
-
-        # Aggressive take only when book clearly mis-quotes vs rolling fair
-        if best_ask <= fair - TOMATOES_TAKE_EDGE and buy_cap > 0:
-            ask_vol = -od.sell_orders[best_ask]
-            qty = min(ask_vol, buy_cap)
-            orders.append(Order("TOMATOES", best_ask, qty))
-            buy_cap -= qty
-
-        if best_bid >= fair + TOMATOES_TAKE_EDGE and sell_cap > 0:
-            bid_vol = od.buy_orders[best_bid]
-            qty = min(bid_vol, sell_cap)
-            orders.append(Order("TOMATOES", best_bid, -qty))
-            sell_cap -= qty
-
-        # Inventory skew + soft z-score fade: centre shifts against position
-        # and slightly against current deviation from rolling fair.
-        inv_skew = -pos / limit  # in [-1, 1]
-        z_skew = -TOMATOES_Z_SKEW * zscore
-        centre = fair + inv_skew + z_skew
-        make_bid = int(round(centre - TOMATOES_MAKE_EDGE))
-        make_ask = int(round(centre + TOMATOES_MAKE_EDGE))
-
-        # Stay inside existing book
-        if make_bid >= best_ask:
-            make_bid = best_ask - 1
-        if make_ask <= best_bid:
-            make_ask = best_bid + 1
+        # Never cross fair with a passive quote — stay on the correct side.
+        if my_bid >= fair:
+            my_bid = int(fair) - 1
+        if my_ask <= fair:
+            my_ask = int(fair) + 1
 
         if buy_cap > 0:
-            orders.append(Order("TOMATOES", make_bid, buy_cap))
+            out.append(Order(symbol, my_bid, buy_cap))
         if sell_cap > 0:
-            orders.append(Order("TOMATOES", make_ask, -sell_cap))
+            out.append(Order(symbol, my_ask, -sell_cap))
 
-        return orders, history
+        return out
